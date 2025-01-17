@@ -1,0 +1,86 @@
+https://medium.com/@patilsomesh88/read-data-from-kafka-store-into-delta-lake-a7002e8895cd
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json
+from pyspark.sql.types import StructType, StructField, StringType
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("KafkaToDeltaToCosmos")
+
+try:
+    # Initialize Spark Session with optimizations
+    spark = SparkSession.builder \
+        .appName("KafkaToDeltaToCosmos") \
+        .config("spark.sql.shuffle.partitions", "200") \  # Optimized shuffle partitions
+        .config("spark.databricks.delta.optimizeWrite.enabled", "true") \  # Enable Delta write optimization
+        .config("spark.databricks.delta.autoCompact.enabled", "true") \  # Enable Delta auto-compaction
+        .getOrCreate()
+
+    # Define schema for Kafka messages
+    kafka_message_schema = StructType([
+        StructField("id", StringType(), True),
+        StructField("name", StringType(), True),
+        StructField("timestamp", StringType(), True)
+    ])
+
+    # Read data from Kafka
+    kafka_data = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "your_kafka_broker:9092") \
+        .option("subscribe", "your_kafka_topic") \
+        .option("startingOffsets", "latest") \  # Adjust to "earliest" if needed
+        .load()
+
+    # Deserialize Kafka message value
+    kafka_deserialized = kafka_data.selectExpr("CAST(value AS STRING)") \
+        .select(from_json(col("value"), kafka_message_schema).alias("data")) \
+        .select("data.*")
+
+    # Define Delta table path
+    delta_table_path = "/mnt/delta/your_table"
+
+    # Write raw data to Delta Lake
+    kafka_deserialized.writeStream \
+        .format("delta") \
+        .outputMode("append") \
+        .option("checkpointLocation", "/mnt/delta/checkpoints/your_table") \
+        .start(delta_table_path)
+
+    logger.info("Data written to Delta Lake successfully.")
+
+    # Read data back from Delta table for transformations
+    delta_data = spark.read.format("delta").load(delta_table_path)
+
+    # Example transformation: Add a new column
+    transformed_data = delta_data.withColumn("processed_timestamp", col("timestamp"))
+
+    # Configure Cosmos DB settings
+    cosmos_db_config = {
+        "Endpoint": "your_cosmos_db_endpoint",
+        "Masterkey": "your_cosmos_db_key",
+        "Database": "your_database",
+        "Collection": "your_collection",
+        "Upsert": "true"  # Ensures existing documents are updated
+    }
+
+    # Write transformed data to Cosmos DB
+    transformed_data.writeStream \
+        .format("cosmos.oltp") \
+        .outputMode("append") \
+        .options(**cosmos_db_config) \
+        .option("checkpointLocation", "/mnt/cosmos/checkpoints/your_collection") \
+        .start()
+
+    logger.info("Data written to Cosmos DB successfully.")
+
+except Exception as e:
+    logger.error(f"An error occurred: {str(e)}", exc_info=True)
+
+finally:
+    # Stop Spark session
+    if 'spark' in locals():
+        spark.stop()
+    logger.info("Spark session stopped.")
